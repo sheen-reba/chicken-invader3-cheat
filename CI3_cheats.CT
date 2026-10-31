@@ -1,0 +1,259 @@
+<?xml version="1.0" encoding="utf-8"?>
+<CheatTable CheatEngineTableVersion="52">
+  <CheatEntries>
+    <CheatEntry>
+      <ID>1</ID>
+      <Description>"=== 使用说明: Table -> Show Cheat Table Lua Script -> Execute ==="</Description>
+      <LastState/>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>[ENABLE]
+// 本条目不开任何补丁, 只作说明.
+// 真正逻辑在表的 Lua 脚本里: 菜单 Table -> Show Cheat Table Lua Script -> Execute
+// 支持 CI3.exe / CI3Easter.exe / CI3Xmas.exe, 需先进入关卡.
+// 改数值: CI3MOD.cfg.lives / .missiles / .weaponLevel (0..9)
+[DISABLE]
+</AssemblerScript>
+    </CheatEntry>
+  </CheatEntries>
+  <UserdefinedSymbols/>
+  <LuaScript>--[[ ==========================================================================
+  Chicken Invaders 3 (3.85steam) 内存修改器 —— Cheat Engine Lua
+  适用: CI3.exe / CI3Easter.exe / CI3Xmas.exe  （同一套引擎的三个版本）
+
+  用法:
+    1) CE 先附加到游戏进程（CI3.exe 等）
+    2) CE 菜单 File -&gt; Execute Script -&gt; 选本文件 -&gt; Execute
+       或者载入 CI3_cheats.CT 后 Table -&gt; Show Cheat Table Lua Script -&gt; Execute
+    3) 控制台会打印定位结果；之后每 200ms 自动维持数值
+
+  原理（逆向结论，详见 逆向报告_生命数_武器_导弹.md）:
+    * 游戏用 NetRole 网络层同步状态，数值是 (key ^ value) 编码，key 由 RNG 轮换。
+      所以不能冻结原始 dword，必须写成  value = key ^ 目标值。
+    * PlayerObject   : vtable 定位，+0x2AC = 所属 PlayerInfo，+0x2D4 = Weapon
+    * PlayerInfo     : +0x25C^+0x2E0 = 命数    +0x46C^+0x4F0 = 导弹数
+                       +0x364^+0x3E8 = 鸡腿    +0x154^+0x1D8 = 分数
+    * Weapon         : +0x2F8 = 武器等级（明文 int；死亡时会被引擎钳制为 max(等级/2, 等级-5)）
+    * 武器等级的 HUD 数字只在状态变化时重绘，写入后不一定立刻显示，但伤害/弹道已生效。
+============================================================================ ]]
+
+if CI3MOD then pcall(CI3MOD.stop) end
+
+local CFG = {
+  lives       = 99,   -- 命数（游戏上限 99）
+  missiles    = 99,   -- 导弹数（游戏上限 99）
+  weaponLevel = 9,    -- 武器等级：有效范围 0~9（10 档），&gt;9 会掉进空分支导致不开火
+  interval    = 200,  -- 维持间隔 ms
+  verbose     = true,
+}
+
+-- 对象内部偏移（三个版本源码相同，偏移一致）
+local OFF = {
+  po_owner   = 0x2AC, -- PlayerObject -&gt; PlayerInfo*
+  po_weapon  = 0x2D4, -- PlayerObject -&gt; Weapon*
+  wp_power   = 0x2F8, -- Weapon  -&gt; 武器等级(int)
+  pi_score_k = 0x154, pi_score_v = 0x1D8, -- 分数
+  pi_lives_k = 0x25C, pi_lives_v = 0x2E0, -- 命数
+  pi_food_k  = 0x364, pi_food_v  = 0x3E8, -- 鸡腿
+  pi_miss_k  = 0x46C, pi_miss_v  = 0x4F0, -- 导弹数
+}
+
+-- 每个 exe 的 PlayerObject vtable RVA（= 静态VA - 0x400000）
+-- 三个版本同源，对象内部偏移完全一致，只有 vtable 地址不同
+local BUILDS = {
+  ["ci3.exe"]       = { poVt = 0x2D5E70 }, -- CI3.exe        vtable 0x6D5E70 (49 项)
+  ["ci3easter.exe"] = { poVt = 0x2D5F10 }, -- CI3Easter.exe  vtable 0x6D5F10 (49 项)
+  ["ci3xmas.exe"]   = { poVt = 0x2D5EC0 }, -- CI3Xmas.exe    vtable 0x6D5EC0 (49 项)
+}
+
+local state = { base = nil, build = nil, po = {}, timer = nil, lastScan = 0 }
+
+local function log(fmt, ...)
+  if CFG.verbose then print(string.format("[CI3MOD] " .. fmt, ...)) end
+end
+
+local function u32at(a)
+  local ok, v = pcall(readInteger, a)
+  if ok and v then return v &amp; 0xFFFFFFFF end
+  return nil
+end
+
+local function decode(pi, k, v)
+  local a, b = u32at(pi + k), u32at(pi + v)
+  if a == nil or b == nil then return nil end
+  return (a ~ b) &amp; 0xFFFFFFFF
+end
+
+local function encode(pi, k, v, target)
+  local key = u32at(pi + k)
+  if key == nil then return false end
+  pcall(writeInteger, pi + v, (key ~ target) &amp; 0xFFFFFFFF)
+  return true
+end
+
+local function bytesPattern(v)
+  local b = {}
+  for i = 0, 3 do b[i + 1] = (v &gt;&gt; (i * 8)) &amp; 0xFF end
+  return string.format("%02X %02X %02X %02X", b[1], b[2], b[3], b[4])
+end
+
+-- 找到主模块并把名字/prg 对应到 BUILDS
+local function locateModule()
+  local mods = enumModules()
+  if not mods then return nil end
+  for i = 1, #mods do
+    local name = mods[i].Name or ""
+    local short = name:match("([^\\/]+)$") or name
+    local key = short:lower()
+    if BUILDS[key] then
+      local addr = mods[i].Address
+      if type(addr) == "string" then addr = getAddressSafe(addr) end
+      return addr, key, short
+    end
+  end
+  return nil
+end
+
+-- AOB 扫描 PlayerObject 的 vtable 指针，返回所有实例
+local function scanPlayerObjects()
+  local base, key = locateModule()
+  if not base or not key then
+    log("找不到游戏主模块（CI3*.exe）")
+    return {}
+  end
+  state.base, state.build = base, key
+  local vt = base + BUILDS[key].poVt
+  local sl = AOBScan(bytesPattern(vt))
+  local out = {}
+  if sl then
+    for i = 0, sl.Count - 1 do
+      local a = getAddressSafe(sl[i])
+      if a and u32at(a) == vt then
+        local inModule = (a &gt;= base) and (a &lt; base + 0x600000)
+        if not inModule then
+          local pi = u32at(a + OFF.po_owner)
+          local wp = u32at(a + OFF.po_weapon)
+          if pi and pi &gt; 0x10000 and pi &lt; 0x80000000 then
+            out[#out + 1] = { po = a, pi = pi, weapon = (wp and wp &gt; 0x10000) and wp or 0 }
+          end
+        end
+      end
+    end
+    sl.destroy()
+  end
+  log("%s base=0x%X PlayerObject=%d 个", key, base, #out)
+  return out
+end
+
+local function apply()
+  if #state.po == 0 then return false end
+  local okAny = false
+  -- 引擎的武器等级是分档实现(0..9)，超出范围会掉到空分支 -&gt; 武器不开火，必须钳制
+  local lvl = CFG.weaponLevel or 0
+  if lvl &lt; 0 then lvl = 0 end
+  if lvl &gt; 9 then lvl = 9 end
+  for _, o in ipairs(state.po) do
+    -- 命数 / 导弹
+    if CFG.lives and encode(o.pi, OFF.pi_lives_k, OFF.pi_lives_v, CFG.lives) then okAny = true end
+    if CFG.missiles and encode(o.pi, OFF.pi_miss_k, OFF.pi_miss_v, CFG.missiles) then okAny = true end
+    -- 武器等级（明文）
+    if o.weapon and o.weapon &gt; 0x10000 then
+      pcall(writeInteger, o.weapon + OFF.wp_power, lvl)
+    end
+  end
+  return okAny
+end
+
+local function refreshIfStale()
+  local ok = #state.po &gt; 0
+  if ok then
+    for _, o in ipairs(state.po) do
+      local pi = u32at(o.po + OFF.po_owner)
+      if pi ~= o.pi then ok = false end
+    end
+  end
+  local now = os.clock()
+  if (not ok) or (now - state.lastScan &gt; 2.0) then
+    state.po = scanPlayerObjects()
+    state.lastScan = now
+  end
+end
+
+CI3MOD = {}
+
+-- 运行期可直接改：CI3MOD.cfg.lives = 5 / CI3MOD.cfg.missiles = 30 / CI3MOD.cfg.weaponLevel = 10
+CI3MOD.cfg = CFG
+
+function CI3MOD.set(field, value)
+  if CFG[field] == nil then return false end
+  CFG[field] = value
+  log("%s = %s", field, tostring(value))
+  return true
+end
+
+function CI3MOD.read()
+  local r = {}
+  for _, o in ipairs(state.po) do
+    r[#r + 1] = {
+      po = o.po, pi = o.pi, weapon = o.weapon,
+      lives   = decode(o.pi, OFF.pi_lives_k, OFF.pi_lives_v),
+      missiles= decode(o.pi, OFF.pi_miss_k, OFF.pi_miss_v),
+      food    = decode(o.pi, OFF.pi_food_k, OFF.pi_food_v),
+      score   = decode(o.pi, OFF.pi_score_k, OFF.pi_score_v),
+      weaponLevel = (o.weapon &gt; 0x10000) and u32at(o.weapon + OFF.wp_power) or nil,
+    }
+  end
+  return r
+end
+
+function CI3MOD.rescan()
+  state.po = scanPlayerObjects()
+  state.lastScan = os.clock()
+  return state.po
+end
+
+function CI3MOD.stop()
+  if CI3MOD.timer then
+    CI3MOD.timer.Enabled = false
+    CI3MOD.timer.destroy()
+    CI3MOD.timer = nil
+    log("已停止")
+  end
+end
+
+function CI3MOD.start()
+  CI3MOD.rescan()
+  apply()
+  if CI3MOD.timer then
+    CI3MOD.timer.Enabled = false
+    CI3MOD.timer.destroy()
+    CI3MOD.timer = nil
+  end
+  local t = createTimer(nil, false)
+  t.Interval = CFG.interval
+  t.OnTimer = function()
+    pcall(function()
+      refreshIfStale()
+      apply()
+    end)
+  end
+  t.Enabled = true
+  CI3MOD.timer = t   -- 必须挂在全局表上，否则会被 GC
+  log("已启动：命数=%d 导弹=%d 武器等级=%d（每 %dms 维持）",
+      CFG.lives, CFG.missiles, CFG.weaponLevel, CFG.interval)
+end
+
+-- 自动启动
+CI3MOD.start()
+do
+  local r = CI3MOD.read()
+  for i, v in ipairs(r) do
+    log("副本%d PO=0x%X PI=0x%X 命数=%s 导弹=%s 鸡腿=%s 分数=%s 武器=%s",
+        i, v.po, v.pi, tostring(v.lives), tostring(v.missiles), tostring(v.food),
+        tostring(v.score), tostring(v.weaponLevel))
+  end
+  if #r == 0 then
+    log("没找到玩家对象：请确认游戏已进入关卡（不是主菜单）")
+  end
+end
+</LuaScript>
+</CheatTable>
